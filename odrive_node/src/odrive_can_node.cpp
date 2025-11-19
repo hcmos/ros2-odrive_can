@@ -29,14 +29,14 @@ enum ControlMode : uint64_t {
 };
 
 ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_name) {
-    
+
     rclcpp::Node::declare_parameter<std::string>("interface", "can0");
     rclcpp::Node::declare_parameter<uint16_t>("node_id", 0);
     rclcpp::Node::declare_parameter<bool>("axis_idle_on_shutdown", false);
 
     rclcpp::QoS ctrl_stat_qos(rclcpp::KeepAll{});
     ctrl_publisher_ = rclcpp::Node::create_publisher<ControllerStatus>("controller_status", ctrl_stat_qos);
-    
+
     rclcpp::QoS odrv_stat_qos(rclcpp::KeepAll{});
     odrv_publisher_ = rclcpp::Node::create_publisher<ODriveStatus>("odrive_status", odrv_stat_qos);
 
@@ -48,6 +48,9 @@ ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_n
 
     rclcpp::QoS srv_clear_errors_qos(rclcpp::KeepAll{});
     service_clear_errors_ = rclcpp::Node::create_service<Empty>("clear_errors", std::bind(&ODriveCanNode::service_clear_errors_callback, this, _1, _2), srv_clear_errors_qos.get_rmw_qos_profile());
+
+    rclcpp::QoS can_qos(rclcpp::KeepAll{});
+    publisher_can = rclcpp::Node::create_publisher<socketcan_interface_msg::msg::SocketcanIF>("can_tx", can_qos);
 }
 
 void ODriveCanNode::deinit() {
@@ -56,12 +59,12 @@ void ODriveCanNode::deinit() {
         frame.can_id = node_id_ << 5 | CmdId::kSetAxisState;
         write_le<uint32_t>(ODriveAxisState::AXIS_STATE_IDLE, frame.data);
         frame.can_dlc = 4;
-        can_intf_.send_can_frame(frame);
+        send_can_frame(frame);
     }
 
     sub_evt_.deinit();
     srv_evt_.deinit();
-    can_intf_.deinit();
+    // can_intf_.deinit();
 }
 
 bool ODriveCanNode::init(EpollEventLoop* event_loop) {
@@ -70,10 +73,10 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
     axis_idle_on_shutdown_ = rclcpp::Node::get_parameter("axis_idle_on_shutdown").as_bool();
     std::string interface = rclcpp::Node::get_parameter("interface").as_string();
 
-    if (!can_intf_.init(interface, event_loop, std::bind(&ODriveCanNode::recv_callback, this, _1))) {
-        RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize socket can interface: %s", interface.c_str());
-        return false;
-    }
+    // if (!can_intf_.init(interface, event_loop, std::bind(&ODriveCanNode::recv_callback, this, _1))) {
+    //     RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize socket can interface: %s", interface.c_str());
+    //     return false;
+    // }
     if (!sub_evt_.init(event_loop, std::bind(&ODriveCanNode::ctrl_msg_callback, this))) {
         RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize subscriber event");
         return false;
@@ -152,7 +155,7 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
             std::lock_guard<std::mutex> guard(ctrl_stat_mutex_);
             ctrl_stat_.torque_target   = read_le<float>(frame.data + 0);
             ctrl_stat_.torque_estimate = read_le<float>(frame.data + 4);
-            ctrl_pub_flag_ |= 0b1000; 
+            ctrl_pub_flag_ |= 0b1000;
             break;
         }
         case CmdId::kSetAxisState:
@@ -168,12 +171,12 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
             break;
         }
     }
-    
+
     if (ctrl_pub_flag_ == 0b1111) {
         ctrl_publisher_->publish(ctrl_stat_);
         ctrl_pub_flag_ = 0;
     }
-    
+
     if (odrv_pub_flag_ == 0b111) {
         odrv_publisher_->publish(odrv_stat_);
         odrv_pub_flag_ = 0;
@@ -206,7 +209,7 @@ void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> r
         bool complete = (requested_closed_loop || !is_busy) && minimum_time_passed;
         return complete;
         }); // wait for procedure_result
-    
+
     response->axis_state = ctrl_stat_.axis_state;
     response->active_errors = ctrl_stat_.active_errors;
     response->procedure_result = ctrl_stat_.procedure_result;
@@ -231,14 +234,14 @@ void ODriveCanNode::request_state_callback() {
         frame.can_id = node_id_ << 5 | CmdId::kClearErrors;
         write_le<uint8_t>(0, frame.data);
         frame.can_dlc = 1;
-        can_intf_.send_can_frame(frame);
+        send_can_frame(frame);
     }
 
     // Set state
     frame.can_id = node_id_ << 5 | CmdId::kSetAxisState;
     write_le<uint32_t>(axis_state, frame.data);
     frame.can_dlc = 4;
-    can_intf_.send_can_frame(frame);
+    send_can_frame(frame);
 }
 
 void ODriveCanNode::request_clear_errors_callback() {
@@ -246,7 +249,7 @@ void ODriveCanNode::request_clear_errors_callback() {
     frame.can_id = node_id_ << 5 | CmdId::kClearErrors;
     write_le<uint8_t>(0, frame.data);
     frame.can_dlc = 1;
-    can_intf_.send_can_frame(frame);
+    send_can_frame(frame);
 }
 
 void ODriveCanNode::ctrl_msg_callback() {
@@ -261,8 +264,8 @@ void ODriveCanNode::ctrl_msg_callback() {
         control_mode = ctrl_msg_.control_mode;
     }
     frame.can_dlc = 8;
-    can_intf_.send_can_frame(frame);
-    
+    send_can_frame(frame);
+
     frame = can_frame{};
     switch (control_mode) {
         case ControlMode::kVoltageControl: {
@@ -295,13 +298,13 @@ void ODriveCanNode::ctrl_msg_callback() {
             write_le<int8_t>(((int8_t)((ctrl_msg_.input_torque) * 1000)), frame.data + 6);
             frame.can_dlc = 8;
             break;
-        }    
-        default: 
+        }
+        default:
             RCLCPP_ERROR(rclcpp::Node::get_logger(), "unsupported control_mode: %d", control_mode);
             return;
     }
 
-    can_intf_.send_can_frame(frame);
+    send_can_frame(frame);
 }
 
 inline bool ODriveCanNode::verify_length(const std::string&name, uint8_t expected, uint8_t length) {
@@ -309,4 +312,14 @@ inline bool ODriveCanNode::verify_length(const std::string&name, uint8_t expecte
     RCLCPP_DEBUG(rclcpp::Node::get_logger(), "received %s", name.c_str());
     if (!valid) RCLCPP_WARN(rclcpp::Node::get_logger(), "Incorrect %s frame length: %d != %d", name.c_str(), length, expected);
     return valid;
+}
+
+void ODriveCanNode::send_can_frame(const struct can_frame& frame) {
+     // 出版
+    auto msg_can = std::make_shared<socketcan_interface_msg::msg::SocketcanIF>();
+    msg_can->canid = frame.can_id;
+    msg_can->candlc = frame.can_dlc;
+
+    for(int i=0; i<msg_can->candlc; i++) msg_can->candata[i]=frame.data[i];
+    publisher_can->publish(*msg_can);
 }

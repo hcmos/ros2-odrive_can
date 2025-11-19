@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(socketcan_interface_msg REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ControlMessage.msg"
@@ -32,6 +33,7 @@ add_executable(odrive_can_node
 ament_target_dependencies(odrive_can_node
   rclcpp
   std_srvs
+  socketcan_interface_msg
 )
 
 target_compile_features(odrive_can_node PRIVATE cxx_std_20)

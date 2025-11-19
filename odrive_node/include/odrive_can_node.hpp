@@ -7,6 +7,7 @@
 #include "odrive_can/msg/control_message.hpp"
 #include "odrive_can/srv/axis_state.hpp"
 #include "std_srvs/srv/empty.hpp"
+#include "socketcan_interface_msg/msg/socketcan_if.hpp"
 #include "socket_can.hpp"
 
 #include <mutex>
@@ -29,7 +30,7 @@ using Empty = std_srvs::srv::Empty;
 class ODriveCanNode : public rclcpp::Node {
 public:
     ODriveCanNode(const std::string& node_name);
-    bool init(EpollEventLoop* event_loop); 
+    bool init(EpollEventLoop* event_loop);
     void deinit();
 private:
     void recv_callback(const can_frame& frame);
@@ -40,16 +41,20 @@ private:
     void request_clear_errors_callback();
     void ctrl_msg_callback();
     inline bool verify_length(const std::string&name, uint8_t expected, uint8_t length);
-    
+
+    // socke can if
+    rclcpp::Publisher<socketcan_interface_msg::msg::SocketcanIF>::SharedPtr publisher_can;
+    void send_can_frame(const struct can_frame& frame);
+
     uint16_t node_id_;
     bool axis_idle_on_shutdown_;
-    SocketCanIntf can_intf_ = SocketCanIntf();
-    
+    // SocketCanIntf can_intf_ = SocketCanIntf();
+
     short int ctrl_pub_flag_ = 0;
     std::mutex ctrl_stat_mutex_;
     ControllerStatus ctrl_stat_ = ControllerStatus();
     rclcpp::Publisher<ControllerStatus>::SharedPtr ctrl_publisher_;
-    
+
     short int odrv_pub_flag_ = 0;
     std::mutex odrv_stat_mutex_;
     ODriveStatus odrv_stat_ = ODriveStatus();
