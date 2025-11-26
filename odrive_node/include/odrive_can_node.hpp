@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <array>
 #include <algorithm>
+#include <vector>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 
@@ -41,10 +42,12 @@ private:
     void request_clear_errors_callback();
     void ctrl_msg_callback();
     inline bool verify_length(const std::string&name, uint8_t expected, uint8_t length);
+    void can_rx_callback(const socketcan_interface_msg::msg::SocketcanIF::SharedPtr msg);
 
     // socke can if
     rclcpp::Publisher<socketcan_interface_msg::msg::SocketcanIF>::SharedPtr publisher_can;
     void send_can_frame(const struct can_frame& frame);
+    std::vector<rclcpp::Subscription<socketcan_interface_msg::msg::SocketcanIF>::SharedPtr> can_rx_subscriptions_;
 
     uint16_t node_id_;
     bool axis_idle_on_shutdown_;

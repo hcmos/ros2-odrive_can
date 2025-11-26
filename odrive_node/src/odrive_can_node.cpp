@@ -3,6 +3,7 @@
 #include "epoll_event_loop.hpp"
 #include "byte_swap.hpp"
 #include <sys/eventfd.h>
+#include <boost/format.hpp>
 #include <chrono>
 
 enum CmdId : uint32_t {
@@ -20,6 +21,17 @@ enum CmdId : uint32_t {
     kClearErrors = 0x018,          // ClearErrors       - service
     kGetTorques = 0x01c,           // ControllerStatus  - publisher
 };
+namespace {
+constexpr std::array<uint32_t, 7> kPublisherCmdIds = {
+    CmdId::kHeartbeat,
+    CmdId::kGetError,
+    CmdId::kGetEncoderEstimates,
+    CmdId::kGetIq,
+    CmdId::kGetTemp,
+    CmdId::kGetBusVoltageCurrent,
+    CmdId::kGetTorques,
+};
+}
 
 enum ControlMode : uint64_t {
     kVoltageControl,
@@ -27,6 +39,7 @@ enum ControlMode : uint64_t {
     kVelocityControl,
     kPositionControl,
 };
+
 
 ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_name) {
 
@@ -50,7 +63,7 @@ ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_n
     service_clear_errors_ = rclcpp::Node::create_service<Empty>("clear_errors", std::bind(&ODriveCanNode::service_clear_errors_callback, this, _1, _2), srv_clear_errors_qos.get_rmw_qos_profile());
 
     rclcpp::QoS can_qos(rclcpp::KeepAll{});
-    publisher_can = rclcpp::Node::create_publisher<socketcan_interface_msg::msg::SocketcanIF>("can_tx", can_qos);
+    publisher_can = rclcpp::Node::create_publisher<socketcan_interface_msg::msg::SocketcanIF>("/can_tx", can_qos);
 }
 
 void ODriveCanNode::deinit() {
@@ -64,6 +77,7 @@ void ODriveCanNode::deinit() {
 
     sub_evt_.deinit();
     srv_evt_.deinit();
+    can_rx_subscriptions_.clear();
     // can_intf_.deinit();
 }
 
@@ -89,8 +103,23 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
         RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize clear errors service event");
         return false;
     }
+
+    can_rx_subscriptions_.clear();
+    const uint32_t base_can_id = static_cast<uint32_t>(node_id_) << 5;
+    rclcpp::QoS can_rx_qos(rclcpp::KeepLast(10));
+    for (auto cmd_id : kPublisherCmdIds) {
+        auto topic_name = std::string("/can_rx_") + (boost::format("%03X") % (base_can_id | cmd_id)).str();
+        auto sub = rclcpp::Node::create_subscription<socketcan_interface_msg::msg::SocketcanIF>(
+            topic_name,
+            can_rx_qos,
+            std::bind(&ODriveCanNode::can_rx_callback, this, _1));
+        can_rx_subscriptions_.push_back(sub);
+        RCLCPP_INFO(rclcpp::Node::get_logger(), "Subscribed to %s", topic_name.c_str());
+    }
+
     RCLCPP_INFO(rclcpp::Node::get_logger(), "node_id: %d", node_id_);
     RCLCPP_INFO(rclcpp::Node::get_logger(), "interface: %s", interface.c_str());
+    RCLCPP_INFO(rclcpp::Node::get_logger(), "base CAN ID: 0x%x", base_can_id);
     return true;
 }
 
@@ -312,6 +341,23 @@ inline bool ODriveCanNode::verify_length(const std::string&name, uint8_t expecte
     RCLCPP_DEBUG(rclcpp::Node::get_logger(), "received %s", name.c_str());
     if (!valid) RCLCPP_WARN(rclcpp::Node::get_logger(), "Incorrect %s frame length: %d != %d", name.c_str(), length, expected);
     return valid;
+}
+
+void ODriveCanNode::can_rx_callback(const socketcan_interface_msg::msg::SocketcanIF::SharedPtr msg) {
+    if (msg->candlc > CAN_MAX_DLEN) {
+        RCLCPP_WARN(rclcpp::Node::get_logger(), "Received CAN frame with DLC %u greater than %u", msg->candlc, CAN_MAX_DLEN);
+        return;
+    }
+
+    struct can_frame frame = {};
+    frame.can_id = msg->canid;
+    frame.can_dlc = static_cast<uint8_t>(msg->candlc);
+
+    for (uint8_t i = 0; i < frame.can_dlc; ++i) {
+        frame.data[i] = static_cast<uint8_t>(msg->candata[i]);
+    }
+
+    recv_callback(frame);
 }
 
 void ODriveCanNode::send_can_frame(const struct can_frame& frame) {
