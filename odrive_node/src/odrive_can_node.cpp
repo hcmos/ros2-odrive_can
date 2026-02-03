@@ -114,7 +114,7 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
             can_rx_qos,
             std::bind(&ODriveCanNode::can_rx_callback, this, _1));
         can_rx_subscriptions_.push_back(sub);
-        RCLCPP_INFO(rclcpp::Node::get_logger(), "Subscribed to %s", topic_name.c_str());
+        // RCLCPP_INFO(rclcpp::Node::get_logger(), "Subscribed to %s", topic_name.c_str());
     }
 
     RCLCPP_INFO(rclcpp::Node::get_logger(), "node_id: %d", node_id_);
