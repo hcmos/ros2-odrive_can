@@ -8,7 +8,6 @@
 #include "odrive_can/srv/axis_state.hpp"
 #include "std_srvs/srv/empty.hpp"
 #include "socketcan_interface_msg/msg/socketcan_if.hpp"
-#include "socket_can.hpp"
 
 #include <mutex>
 #include <condition_variable>
@@ -31,7 +30,6 @@ using Empty = std_srvs::srv::Empty;
 class ODriveCanNode : public rclcpp::Node {
 public:
     ODriveCanNode(const std::string& node_name);
-    bool init(EpollEventLoop* event_loop);
     void deinit();
 private:
     void recv_callback(const can_frame& frame);
@@ -63,18 +61,15 @@ private:
     ODriveStatus odrv_stat_ = ODriveStatus();
     rclcpp::Publisher<ODriveStatus>::SharedPtr odrv_publisher_;
 
-    EpollEvent sub_evt_;
     std::mutex ctrl_msg_mutex_;
     ControlMessage ctrl_msg_ = ControlMessage();
     rclcpp::Subscription<ControlMessage>::SharedPtr subscriber_;
 
-    EpollEvent srv_evt_;
     uint32_t axis_state_;
     std::mutex axis_state_mutex_;
     std::condition_variable fresh_heartbeat_;
     rclcpp::Service<AxisState>::SharedPtr service_;
 
-    EpollEvent srv_clear_errors_evt_;
     rclcpp::Service<Empty>::SharedPtr service_clear_errors_;
 
 };

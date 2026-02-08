@@ -1,8 +1,6 @@
 #include "odrive_can_node.hpp"
 #include "odrive_enums.h"
-#include "epoll_event_loop.hpp"
 #include "byte_swap.hpp"
-#include <sys/eventfd.h>
 #include <boost/format.hpp>
 #include <chrono>
 
@@ -43,9 +41,12 @@ enum ControlMode : uint64_t {
 
 ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_name) {
 
-    rclcpp::Node::declare_parameter<std::string>("interface", "can0");
-    rclcpp::Node::declare_parameter<uint16_t>("node_id", 0);
-    rclcpp::Node::declare_parameter<bool>("axis_idle_on_shutdown", false);
+    this->declare_parameter<std::string>("interface", "can0");
+    this->declare_parameter<uint16_t>("node_id", 0);
+    this->declare_parameter<bool>("axis_idle_on_shutdown", false);
+
+    node_id_ = static_cast<uint16_t>(this->get_parameter("node_id").as_int());
+    axis_idle_on_shutdown_ = this->get_parameter("axis_idle_on_shutdown").as_bool();
 
     rclcpp::QoS ctrl_stat_qos(rclcpp::KeepAll{});
     ctrl_publisher_ = rclcpp::Node::create_publisher<ControllerStatus>("controller_status", ctrl_stat_qos);
@@ -62,48 +63,7 @@ ODriveCanNode::ODriveCanNode(const std::string& node_name) : rclcpp::Node(node_n
     rclcpp::QoS srv_clear_errors_qos(rclcpp::KeepAll{});
     service_clear_errors_ = rclcpp::Node::create_service<Empty>("clear_errors", std::bind(&ODriveCanNode::service_clear_errors_callback, this, _1, _2), srv_clear_errors_qos.get_rmw_qos_profile());
 
-    rclcpp::QoS can_qos(rclcpp::KeepAll{});
-    publisher_can = rclcpp::Node::create_publisher<socketcan_interface_msg::msg::SocketcanIF>("/can_tx", can_qos);
-}
-
-void ODriveCanNode::deinit() {
-    if (axis_idle_on_shutdown_) {
-        struct can_frame frame;
-        frame.can_id = node_id_ << 5 | CmdId::kSetAxisState;
-        write_le<uint32_t>(ODriveAxisState::AXIS_STATE_IDLE, frame.data);
-        frame.can_dlc = 4;
-        send_can_frame(frame);
-    }
-
-    sub_evt_.deinit();
-    srv_evt_.deinit();
-    can_rx_subscriptions_.clear();
-    // can_intf_.deinit();
-}
-
-bool ODriveCanNode::init(EpollEventLoop* event_loop) {
-
-    node_id_ = rclcpp::Node::get_parameter("node_id").as_int();
-    axis_idle_on_shutdown_ = rclcpp::Node::get_parameter("axis_idle_on_shutdown").as_bool();
-    std::string interface = rclcpp::Node::get_parameter("interface").as_string();
-
-    // if (!can_intf_.init(interface, event_loop, std::bind(&ODriveCanNode::recv_callback, this, _1))) {
-    //     RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize socket can interface: %s", interface.c_str());
-    //     return false;
-    // }
-    if (!sub_evt_.init(event_loop, std::bind(&ODriveCanNode::ctrl_msg_callback, this))) {
-        RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize subscriber event");
-        return false;
-    }
-    if (!srv_evt_.init(event_loop, std::bind(&ODriveCanNode::request_state_callback, this))) {
-        RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize service event");
-        return false;
-    }
-    if (!srv_clear_errors_evt_.init(event_loop, std::bind(&ODriveCanNode::request_clear_errors_callback, this))) {
-        RCLCPP_ERROR(rclcpp::Node::get_logger(), "Failed to initialize clear errors service event");
-        return false;
-    }
-
+    // socketcan if に合わせて設定
     can_rx_subscriptions_.clear();
     const uint32_t base_can_id = static_cast<uint32_t>(node_id_) << 5;
     rclcpp::QoS can_rx_qos(rclcpp::KeepLast(10));
@@ -117,10 +77,21 @@ bool ODriveCanNode::init(EpollEventLoop* event_loop) {
         // RCLCPP_INFO(rclcpp::Node::get_logger(), "Subscribed to %s", topic_name.c_str());
     }
 
-    RCLCPP_INFO(rclcpp::Node::get_logger(), "node_id: %d", node_id_);
-    RCLCPP_INFO(rclcpp::Node::get_logger(), "interface: %s", interface.c_str());
-    RCLCPP_INFO(rclcpp::Node::get_logger(), "base CAN ID: 0x%x", base_can_id);
-    return true;
+    rclcpp::QoS can_qos(rclcpp::KeepAll{});
+    publisher_can = rclcpp::Node::create_publisher<socketcan_interface_msg::msg::SocketcanIF>("/can_tx", can_qos);
+}
+
+void ODriveCanNode::deinit() {
+    if (axis_idle_on_shutdown_) {
+        struct can_frame frame;
+        frame.can_id = node_id_ << 5 | CmdId::kSetAxisState;
+        write_le<uint32_t>(ODriveAxisState::AXIS_STATE_IDLE, frame.data);
+        frame.can_dlc = 4;
+        send_can_frame(frame);
+    }
+
+    can_rx_subscriptions_.clear();
+    // can_intf_.deinit();
 }
 
 void ODriveCanNode::recv_callback(const can_frame& frame) {
@@ -213,9 +184,11 @@ void ODriveCanNode::recv_callback(const can_frame& frame) {
 }
 
 void ODriveCanNode::subscriber_callback(const ControlMessage::SharedPtr msg) {
-    std::lock_guard<std::mutex> guard(ctrl_msg_mutex_);
-    ctrl_msg_ = *msg;
-    sub_evt_.set();
+    {
+        std::lock_guard<std::mutex> guard(ctrl_msg_mutex_);
+        ctrl_msg_ = *msg;
+    }
+    ctrl_msg_callback();
 }
 
 void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> request, std::shared_ptr<AxisState::Response> response) {
@@ -224,13 +197,15 @@ void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> r
         axis_state_ = request->axis_requested_state;
         RCLCPP_INFO(rclcpp::Node::get_logger(), "requesting axis state: %d", axis_state_);
     }
-    srv_evt_.set();
+    request_state_callback();
 
     // Wait for at least 1 second for a new heartbeat to arrive.
     // If the requested state is something other than CLOSED_LOOP_CONTROL, also
     // wait for the procedure to complete (procedure_result != BUSY).
     std::unique_lock<std::mutex> guard(ctrl_stat_mutex_); // define lock for controller status
-    auto call_time = std::chrono::steady_clock::now();
+
+    // ここで待つとROSの実行スレッドを奪ってしまう
+    /*
     fresh_heartbeat_.wait(guard, [this, &call_time, &request]() {
         bool is_busy = this->ctrl_stat_.procedure_result == ODriveProcedureResult::PROCEDURE_RESULT_BUSY;
         bool requested_closed_loop = request->axis_requested_state == ODriveAxisState::AXIS_STATE_CLOSED_LOOP_CONTROL;
@@ -238,6 +213,7 @@ void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> r
         bool complete = (requested_closed_loop || !is_busy) && minimum_time_passed;
         return complete;
         }); // wait for procedure_result
+    */
 
     response->axis_state = ctrl_stat_.axis_state;
     response->active_errors = ctrl_stat_.active_errors;
@@ -246,7 +222,7 @@ void ODriveCanNode::service_callback(const std::shared_ptr<AxisState::Request> r
 
 void ODriveCanNode::service_clear_errors_callback(const std::shared_ptr<Empty::Request> request, std::shared_ptr<Empty::Response> response) {
     RCLCPP_INFO(rclcpp::Node::get_logger(), "clearing errors");
-    srv_clear_errors_evt_.set();
+    request_clear_errors_callback();
 }
 
 void ODriveCanNode::request_state_callback() {
